@@ -33,6 +33,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import ssl
 import struct
 import sys
@@ -249,17 +250,17 @@ def authenticate(client: Panel) -> None:
 RENEW_HINTS = ("renew", "extend", "expiry", "expiration")
 
 
-def discover(client: Panel) -> list[dict[str, str]]:
-    """Read /api/openapi.json and list routes whose path hints at renewal."""
+def discover(client: Panel) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Read /api/openapi.json. Returns (renewal-ish routes, every documented path)."""
     try:
         spec = client.request("GET", "/api/openapi.json", retries=1)
     except ApiError as exc:
         log(f"openapi.json unavailable: {exc}", "warn")
-        return []
+        return [], {}
     paths = spec.get("paths") if isinstance(spec, dict) else None
     if not isinstance(paths, dict):
         log("openapi.json has no usable 'paths' section", "warn")
-        return []
+        return [], {}
     found: list[dict[str, str]] = []
     for path, ops in paths.items():
         if not isinstance(ops, dict):
@@ -274,7 +275,27 @@ def discover(client: Panel) -> list[dict[str, str]]:
                     "path": str(path),
                     "summary": str(ops[method].get("summary") or ""),
                 })
-    return found
+    return found, paths
+
+
+def methods_of(ops: Any) -> str:
+    if not isinstance(ops, dict):
+        return "?"
+    return ",".join(m.upper() for m in
+                    ("get", "post", "put", "patch", "delete") if m in ops) or "?"
+
+
+SECRET_HINT = re.compile(r"secret|password|passwd|token|private|api_?key|credential", re.I)
+
+
+def redact(obj: Any) -> Any:
+    """Mask anything that looks like a credential before printing."""
+    if isinstance(obj, dict):
+        return {k: ("***redacted***" if SECRET_HINT.search(str(k)) else redact(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact(v) for v in obj]
+    return obj
 
 
 def resolve_renew_endpoint(client: Panel, discovered: list[dict[str, str]],
@@ -524,6 +545,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="report due dates without renewing")
     parser.add_argument("--discover", action="store_true",
                         help="list API routes related to renewal and exit")
+    parser.add_argument("--dump", action="store_true",
+                        help="print the raw server objects the API returns, then exit")
     parser.add_argument("--before-hours", type=float,
                         default=float(env("SKYCASTLE_RENEW_BEFORE_HOURS")
                                       or DEFAULT_RENEW_BEFORE_HOURS))
@@ -540,19 +563,42 @@ def main(argv: list[str] | None = None) -> int:
         log(f"auth failed: {exc} [{exc.code}]", "err")
         return 2
 
-    discovered = discover(client)
+    if args.dump:
+        # Everything the API is willing to tell us about the account, so the
+        # due-date / cost fields can be identified without guessing.
+        servers = list_servers(client)
+        log(f"{len(servers)} server object(s) returned")
+        payload: dict[str, Any] = {"servers": redact(servers)}
+        credits = get_credits(client)
+        if credits is not None:
+            payload["credits"] = credits
+        print("\n" + json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n")
+        print("Credential-looking fields are masked. Everything else is verbatim.\n")
+        return 0
+
+    discovered, all_paths = discover(client)
 
     if args.discover:
-        if not discovered:
-            log("no renewal-ish routes found in /api/openapi.json", "warn")
-            print("\nNothing matched. Routes containing "
-                  f"{', '.join(RENEW_HINTS)} were not found.\n")
-            return 0
-        print("\nRoutes mentioning renewal / extension:\n")
-        for e in discovered:
-            print(f"  {e['method']:<6} {e['path']}   {e['summary']}")
-        print("\nSet SKYCASTLE_RENEW_PATH to the one for servers if it is not "
-              "auto-detected.\n")
+        print(f"\n/api/openapi.json advertises {len(all_paths)} routes in total.\n")
+        related = sorted(p for p in all_paths
+                         if any(k in p.lower() for k in
+                                ("/servers", "/vds", "/billing", "/renew", "/expir")))
+        if related:
+            print("Routes mentioning servers / vds / billing / renewal / expiry:")
+            for path in related:
+                print(f"  {methods_of(all_paths[path]):<22} {path}")
+            print()
+        if discovered:
+            print("Renewal-related routes found:")
+            for e in discovered:
+                print(f"  {e['method']:<6} {e['path']}   {e['summary']}")
+            print("\nIf a server one is not auto-detected, set "
+                  "SKYCASTLE_RENEW_PATH.\n")
+        else:
+            print("None of these mention renewal / extension / expiry.")
+            print("The renewal widget comes from a private plugin that is not in the")
+            print("public spec, so its route has to come from the panel itself:")
+            print("Account -> API Keys -> 'API Documentation', search for renew.\n")
         return 0
 
     apply = not args.check and env("SKYCASTLE_DRY_RUN", "").lower() not in {"1", "true", "yes"}
