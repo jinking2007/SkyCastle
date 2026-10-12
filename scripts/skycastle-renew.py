@@ -12,7 +12,11 @@ Auth (pick one):
 
 Modes:
     --discover   list every API route whose path mentions renew/extend/expiry
-                 (reads /api/openapi.json). Run this first.
+                 (reads /api/openapi.json)
+    --recon      read-only GET sweep of the billing / subscription endpoints;
+                 tells you whether the server auto-renews on a plan
+    --sniff      pull the renewal endpoint out of the panel's own front-end JS
+    --dump       print the raw server objects the API returns
     --check      report per-server due dates, change nothing
     (default)    renew servers whose remaining time is under --before-hours
 
@@ -175,6 +179,29 @@ class Panel:
                     continue
                 raise ApiError(f"network failure: {exc}", "NETWORK") from exc
         raise ApiError(f"request failed: {last}", "NETWORK")
+
+    def raw(self, path: str, timeout: int | None = None) -> tuple[int, str]:
+        """Fetch a path and return (status, body) without JSON parsing.
+
+        Used to pull the panel's own HTML/JS, which is how the renewal widget's
+        endpoint can be read off the front-end instead of being guessed.
+        """
+        url = path if path.startswith("http") else f"{self.base}{path}"
+        headers = {
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/javascript,*/*",
+            "Referer": self.base,
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(url, method="GET", headers=headers)
+        try:
+            with self.opener.open(req, timeout=timeout or self.timeout) as resp:
+                return resp.status, resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", "replace")
+        except Exception as exc:  # noqa: BLE001
+            return 0, f"<error: {exc}>"
 
 
 # --------------------------------------------------------------------------- #
@@ -538,6 +565,97 @@ def format_report(report: dict[str, Any], panel: str, mode: str) -> str:
     return "\n".join(lines)
 
 
+RECON_PATHS = (
+    "/api/user/servers",
+    "/api/user/billingcore/credits",
+    "/api/user/billingplans/subscriptions",
+    "/api/user/billingplans/categories",
+    "/api/user/billingresourcesstore/packages",
+    "/api/user/billingresourcesstore/purchases",
+    "/api/user/billingresources/servers",
+    "/api/user/billingresources/resources",
+)
+ROUTE_RE = re.compile(r"""["'`](/api/[A-Za-z0-9_\-/{}$.:]{4,120})""")
+SNIFF_PAGES = ("/", "/dashboard", "/servers")
+
+
+def recon(client: Panel) -> int:
+    """Read-only sweep of the billing / subscription endpoints.
+
+    Answers the one question that decides everything: is this server on an
+    auto-renewing plan the panel charges by itself, or does something have to
+    trigger the renewal. Every request here is a GET; nothing is bought.
+    """
+    print("Read-only recon - GET only, nothing is purchased or modified.\n")
+    for path in RECON_PATHS:
+        try:
+            payload = client.request("GET", path, retries=1)
+            status = payload.get("status") if isinstance(payload, dict) else "?"
+            data = payload.get("data", payload) if isinstance(payload, dict) else payload
+            print(f"--- GET {path}   [{status}]")
+            print(json.dumps(redact(data), indent=2, ensure_ascii=False,
+                             default=str)[:4000])
+        except ApiError as exc:
+            print(f"--- GET {path}   -> {exc} [{exc.code}]")
+        print()
+    print("Look for a subscription carrying next_renewal_at with status=active.")
+    print("If the server has one, the panel renews it on its own - no script needed.")
+    return 0
+
+
+def sniff(client: Panel, pages: list[str] | None = None) -> int:
+    """Read the renewal endpoint straight out of the panel's own front-end.
+
+    Loads a few authenticated pages, collects the JavaScript they reference,
+    downloads it, and pulls out every /api/... string it mentions. Nothing is
+    guessed and nothing is called beyond harmless GETs on the panel's own assets.
+    """
+    pages = pages or [p for p in (env("SKYCASTLE_SNIFF_PAGES") or "").split(",") if p] \
+        or list(SNIFF_PAGES)
+    js_urls: list[str] = []
+    for page in pages:
+        status, html = client.raw(page)
+        if "auth/login" in html[:4000] and len(html) < 200000:
+            log(f"{page} -> redirected to the login page: no usable session. "
+                f"Set SKYCASTLE_TOKEN to your remember_token value.", "err")
+            return 2
+        found = set(re.findall(r'src="([^"]+\.js)"', html))
+        found |= set(re.findall(r'href="([^"]+\.js)"', html))
+        found |= set(re.findall(r'"(/_next/static/[^"]+\.js)"', html))
+        log(f"{page} [{status}] {len(html)} chars, {len(found)} script(s)")
+        js_urls.extend(sorted(found))
+    js_urls = list(dict.fromkeys(js_urls))
+    log(f"{len(js_urls)} unique script(s) to read")
+
+    routes: set[str] = set()
+    hits: list[str] = []
+    blob_len = 0
+    for url in js_urls:
+        status, body = client.raw(url)
+        if status != 200 or looks_like_html(body):
+            log(f"  skip {url} [{status}]", "warn")
+            continue
+        blob_len += len(body)
+        routes |= set(ROUTE_RE.findall(body))
+        for m in re.finditer(r"renew|extend|prolong", body, re.I):
+            hits.append(body[max(0, m.start() - 160):m.start() + 160])
+
+    print(f"\nRead {blob_len} chars of front-end code, {len(routes)} /api/ paths.\n")
+    interesting = sorted(r for r in routes
+                         if re.search(r"renew|extend|expir|credit|billing", r, re.I))
+    if interesting:
+        print("Billing / renewal-ish endpoints the front-end calls:")
+        for r in interesting:
+            print("  ", r)
+        print()
+    for h in dict.fromkeys(hits):
+        print("  ...", h.replace("\n", " ")[:320])
+    if not hits:
+        print("No renewal wording in the scripts these pages load. Try more pages "
+              "via SKYCASTLE_SNIFF_PAGES (the page that shows the RENEWAL card).")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="SkyCastle renewal via panel API key")
     parser.add_argument("--panel", default=env("SKYCASTLE_PANEL") or PANEL_DEFAULT)
@@ -547,6 +665,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="list API routes related to renewal and exit")
     parser.add_argument("--dump", action="store_true",
                         help="print the raw server objects the API returns, then exit")
+    parser.add_argument("--recon", action="store_true",
+                        help="read-only GET sweep of billing / subscription endpoints")
+    parser.add_argument("--sniff", action="store_true",
+                        help="read the renewal endpoint out of the panel's front-end JS")
     parser.add_argument("--before-hours", type=float,
                         default=float(env("SKYCASTLE_RENEW_BEFORE_HOURS")
                                       or DEFAULT_RENEW_BEFORE_HOURS))
@@ -562,6 +684,12 @@ def main(argv: list[str] | None = None) -> int:
     except ApiError as exc:
         log(f"auth failed: {exc} [{exc.code}]", "err")
         return 2
+
+    if args.recon:
+        return recon(client)
+
+    if args.sniff:
+        return sniff(client)
 
     if args.dump:
         # Everything the API is willing to tell us about the account, so the
@@ -597,8 +725,13 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("None of these mention renewal / extension / expiry.")
             print("The renewal widget comes from a private plugin that is not in the")
-            print("public spec, so its route has to come from the panel itself:")
-            print("Account -> API Keys -> 'API Documentation', search for renew.\n")
+            print("public spec. Next steps, in order:")
+            print("  1. python skycastle-renew.py --recon")
+            print("     read-only sweep of the billing/subscription endpoints - if the")
+            print("     server sits on an auto-renewing plan, nothing needs running.")
+            print("  2. python skycastle-renew.py --sniff")
+            print("     reads the panel's own front-end JS and prints the endpoint.")
+            print("  3. Put whatever those two turn up into SKYCASTLE_RENEW_PATH.\n")
         return 0
 
     apply = not args.check and env("SKYCASTLE_DRY_RUN", "").lower() not in {"1", "true", "yes"}
