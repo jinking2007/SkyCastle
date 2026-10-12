@@ -13,6 +13,8 @@ on:
         type: choice
         options:
           - check
+          - recon
+          - sniff
           - discover
           - dump
           - renew
@@ -51,6 +53,17 @@ jobs:
       - name: Discover renewal endpoint
         if: github.event.inputs.mode == 'discover'
         run: python scripts/skycastle-renew.py --discover
+
+      - name: Recon (read-only billing sweep)
+        if: github.event.inputs.mode == 'recon'
+        run: python scripts/skycastle-renew.py --recon
+
+      - name: Sniff the renewal endpoint from the panel front-end
+        if: github.event.inputs.mode == 'sniff'
+        env:
+          SKYCASTLE_TOKEN: ${{ secrets.SKYCASTLE_TOKEN }}
+          SKYCASTLE_SNIFF_PAGES: ${{ vars.SKYCASTLE_SNIFF_PAGES }}
+        run: python scripts/skycastle-renew.py --sniff
 
       - name: Dump server objects
         if: github.event.inputs.mode == 'dump'
