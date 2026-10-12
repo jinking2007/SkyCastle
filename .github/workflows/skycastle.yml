@@ -2,9 +2,9 @@ name: SkyCastle Auto Renew
 
 on:
   schedule:
-    # 每天 UTC 02:00 和 14:00 各执行一次（北京时间 10:00 和 22:00）
-    - cron: '0 2,14 * * *'
-  workflow_dispatch: # 支持在 GitHub 网页上手动点击运行
+    # 每天 UTC 04:00 执行一次（即北京时间中午 12:00，间隔 24 小时）
+    - cron: '0 4 * * *'
+  workflow_dispatch: # 支持手动点击运行
 
 jobs:
   renew:
