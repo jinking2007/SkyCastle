@@ -9,8 +9,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "check | discover | renew"
-        default: "check"
+        description: "What to do"
+        type: choice
+        options:
+          - check
+          - discover
+          - dump
+          - renew
+        default: check
 
 concurrency:
   group: skycastle-renew
@@ -45,6 +51,10 @@ jobs:
       - name: Discover renewal endpoint
         if: github.event.inputs.mode == 'discover'
         run: python scripts/skycastle-renew.py --discover
+
+      - name: Dump server objects
+        if: github.event.inputs.mode == 'dump'
+        run: python scripts/skycastle-renew.py --dump
 
       - name: Dry run (report only)
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'check'
