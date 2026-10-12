@@ -36,28 +36,20 @@ jobs:
 
       - name: 执行续期脚本
         env:
-          # 核心账号凭据（必填其一）
           SKYCASTLE_EMAIL: ${{ secrets.SKYCASTLE_EMAIL }}
           SKYCASTLE_PASSWORD: ${{ secrets.SKYCASTLE_PASSWORD }}
           SKYCASTLE_TOKEN: ${{ secrets.SKYCASTLE_TOKEN }}
           SKYCASTLE_TOTP: ${{ secrets.SKYCASTLE_TOTP }}
-          
-          # 面板地址（可选，默认 https://panel.skycastle.us）
           SKYCASTLE_PANEL: ${{ secrets.SKYCASTLE_PANEL }}
-          
-          # 通知配置（可选）
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          
-          # 打码平台配置（可选）
           CAPSOLVER_KEY: ${{ secrets.CAPSOLVER_KEY }}
           SKYCASTLE_TURNSTILE_SITEKEY: ${{ secrets.SKYCASTLE_TURNSTILE_SITEKEY }}
         run: |
-          # 借助 xvfb-run 启动虚拟桌面，以支持 UC 验证码 GUI 点击
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
 
-      - name: 上传运行缓存与截图附件 (用于排查问题)
+      - name: 上传运行截图附件
         if: always()
         uses: actions/upload-artifact@v4
         with:
