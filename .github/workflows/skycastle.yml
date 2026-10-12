@@ -1,93 +1,55 @@
-name: SkyCastle Renew + AFK
+name: SkyCastle renewal
 
+# Runs daily. The script only acts when a server is inside the renewal window
+# (default: 36h before its due date), so in practice it renews roughly every
+# 3 days — without ever needing you to be present.
 on:
   schedule:
-    # Every 6 hours. GitHub cron is UTC.
-    - cron: "20 */6 * * *"
+    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: "all = 续期 + 桌面 AFK；renew 只续期；afk 桌面挂机；status 只查询"
-        required: true
-        default: all
-        type: choice
-        options: [all, renew, afk, status, login]
-      minutes:
-        description: "AFK 分钟数（默认只跑10次）"
-        required: false
-        default: "10"
-      panel:
-        description: "面板地址"
-        required: false
-        default: "https://panel.skycastle.us"
+        description: "check | discover | renew"
+        default: "check"
 
 concurrency:
-  group: skycastle-${{ github.repository }}
+  group: skycastle-renew
   cancel-in-progress: false
 
 jobs:
-  run:
+  renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    timeout-minutes: 10
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+    # Required: SKYCASTLE_API_KEY  (repository secret)
+    # Optional: TG 2 + panel/behaviour overrides (empty values are ignored)
+    env:
+      SKYCASTLE_API_KEY: ${{ secrets.SKYCASTLE_API_KEY }}
+      SKYCASTLE_PANEL: ${{ vars.SKYCASTLE_PANEL }}
+      SKYCASTLE_RENEW_BEFORE_HOURS: ${{ vars.SKYCASTLE_RENEW_BEFORE_HOURS }}
+      SKYCASTLE_RENEW_PATH: ${{ vars.SKYCASTLE_RENEW_PATH }}
+      SKYCASTLE_DRY_RUN: ${{ vars.SKYCASTLE_DRY_RUN }}
+      SKYCASTLE_TIMEOUT: ${{ vars.SKYCASTLE_TIMEOUT }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install SeleniumBase UC (Cloudflare Turnstile bypass)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq xvfb
-          pip install --quiet seleniumbase
-          # download chrome/driver helpers used by seleniumbase
-          seleniumbase get chromedriver || true
+      # No dependencies: the script uses only the standard library.
 
-      - name: Restore remember_token cache
-        uses: actions/cache@v4
-        with:
-          path: .skycastle-cache
-          key: skycastle-token-${{ github.repository }}-v1
-          restore-keys: |
-            skycastle-token-${{ github.repository }}-
+      - name: Discover renewal endpoint
+        if: github.event.inputs.mode == 'discover'
+        run: python scripts/skycastle-renew.py --discover
 
-      - name: Run CastleKeep
-        env:
-          SKYCASTLE_PANEL: ${{ github.event.inputs.panel || secrets.SKYCASTLE_PANEL || 'https://panel.skycastle.us' }}
-          SKYCASTLE_EMAIL: ${{ secrets.SKYCASTLE_EMAIL }}
-          SKYCASTLE_USERNAME: ${{ secrets.SKYCASTLE_USERNAME }}
-          SKYCASTLE_PASSWORD: ${{ secrets.SKYCASTLE_PASSWORD }}
-          SKYCASTLE_TOTP: ${{ secrets.SKYCASTLE_TOTP }}
-          SKYCASTLE_TOKEN: ${{ secrets.SKYCASTLE_TOKEN }}
-          SKYCASTLE_REMEMBER_TOKEN: ${{ secrets.SKYCASTLE_REMEMBER_TOKEN }}
-          SKYCASTLE_ACCOUNTS: ${{ secrets.SKYCASTLE_ACCOUNTS }}
-          SKYCASTLE_PLAN_ID: ${{ secrets.SKYCASTLE_PLAN_ID }}
-          SKYCASTLE_COUPON: ${{ secrets.SKYCASTLE_COUPON }}
-          SKYCASTLE_START_SERVERS: ${{ secrets.SKYCASTLE_START_SERVERS || '1' }}
-          SKYCASTLE_SERVER_RENEW: ${{ secrets.SKYCASTLE_SERVER_RENEW || '1' }}
-          SKYCASTLE_RESTART_SERVERS: ${{ secrets.SKYCASTLE_RESTART_SERVERS || '1' }}
-          SKYCASTLE_TG_SCREENSHOT: ${{ secrets.SKYCASTLE_TG_SCREENSHOT || '1' }}
-          SKYCASTLE_SCREENSHOT_PATH: ${{ secrets.SKYCASTLE_SCREENSHOT_PATH || '/dashboard/servers' }}
-          SKYCASTLE_TURNSTILE_SITEKEY: ${{ secrets.SKYCASTLE_TURNSTILE_SITEKEY }}
-          CAPSOLVER_KEY: ${{ secrets.CAPSOLVER_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          SKYCASTLE_MODE: ${{ github.event.inputs.mode || 'all' }}
-          SKYCASTLE_AFK_MINUTES: ${{ github.event.inputs.minutes || '10' }}
-          PYTHONUNBUFFERED: "1"
-          # uc_gui_click_captcha needs a display
-          DISPLAY: ":99"
-        run: xvfb-run -a python -u skycastle.py
+      - name: Dry run (report only)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'check'
+        run: python scripts/skycastle-renew.py --check
 
-      - name: Keep cache even if job failed
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .skycastle-cache
-          key: skycastle-token-${{ github.repository }}-v1
+      - name: Renew if due
+        if: github.event_name == 'schedule' || github.event.inputs.mode == 'renew'
+        run: python scripts/skycastle-renew.py
